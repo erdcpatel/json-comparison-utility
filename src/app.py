@@ -1,16 +1,16 @@
 import streamlit as st
 import pandas as pd
 import json
-from json_comparison import (
+from utils.json_comparison import (
     compare_json_objects,
     compare_json_lists,
     is_json_list_of_objects,
     get_all_keys,
     get_potential_join_keys
 )
-from api_utils import APIHandler
-from state_utils import init_session_state, get_current_comparison_state
-from display_utils import get_distinct_exclusion_keys, apply_filters, highlight_diff
+from utils.api_utils import APIHandler
+from utils.state_utils import init_session_state, get_current_comparison_state
+from utils.display_utils import get_distinct_exclusion_keys, apply_filters, highlight_diff
 from typing import Optional, Dict, Any
 import logging
 
@@ -40,6 +40,24 @@ def load_json(file) -> Optional[Dict]:
     except Exception as e:
         st.error(f"❌ Error loading file: {str(e)}")
         return None
+
+
+def get_flattened_keys(json_data, parent_key=''):
+    """Recursively extract all keys from nested dicts/lists, flattening them (e.g., address.city)."""
+    keys = set()
+    if isinstance(json_data, dict):
+        for k, v in json_data.items():
+            full_key = f"{parent_key}.{k}" if parent_key else k
+            if isinstance(v, dict):
+                keys |= get_flattened_keys(v, full_key)
+            elif isinstance(v, list) and v and isinstance(v[0], dict):
+                # Only sample the first element of the list
+                keys |= get_flattened_keys(v[0], full_key)
+            else:
+                keys.add(full_key)
+    elif isinstance(json_data, list) and json_data and isinstance(json_data[0], dict):
+        keys |= get_flattened_keys(json_data[0], parent_key)
+    return keys
 
 
 def api_config_form(side: str, tab_name: str) -> Dict[str, Any]:
@@ -133,6 +151,22 @@ def display_results(tab_name: str, filters: list):
     )
 
 
+def review_and_exclude_keys(json_data):
+    """Allow users to review and exclude keys before comparison (flattened keys, including nested)."""
+    all_keys = get_flattened_keys(json_data)
+    suggested_exclusions = [key for key in all_keys if any(ts in key.lower() for ts in ['timestamp', 'created_at', 'updated_at', 'run_id'])]
+    with st.expander("🔍 Review and Exclude Keys", expanded=True):
+        st.markdown("**Suggested Exclusions:**")
+        st.write(suggested_exclusions)
+        selected_exclusions = st.multiselect(
+            "Select keys to exclude (including nested):",
+            options=sorted(list(all_keys)),
+            default=suggested_exclusions,
+            key="review_exclusion_selector"
+        )
+    return set(selected_exclusions)
+
+
 # User Guide
 with st.expander("ℹ️ How to use this utility", expanded=False):
     st.markdown("""
@@ -146,7 +180,7 @@ with st.expander("ℹ️ How to use this utility", expanded=False):
     """)
 
 # Main tabs
-tab1, tab2 = st.tabs(["📁 File Comparison", "🌐 API Comparison"])
+tab1, tab2, tab3 = st.tabs(["📁 File Comparison", "🌐 API Comparison", "📝 JSON Formatter"])
 
 with tab1:
     st.subheader("Compare JSON Files")
@@ -164,9 +198,10 @@ with tab1:
         right_json = load_json(right_file)
 
         if left_json and right_json:
-            state['all_keys'] = set()
-            state['all_keys'].update(get_all_keys(left_json))
-            state['all_keys'].update(get_all_keys(right_json))
+            state['all_keys'] = get_flattened_keys(left_json) | get_flattened_keys(right_json)
+
+            # Allow users to review and exclude keys before comparison
+            state['excluded_keys'] = review_and_exclude_keys(left_json)
 
             if is_json_list_of_objects(left_json) and is_json_list_of_objects(right_json):
                 state['potential_join_keys'] = get_potential_join_keys(left_json, right_json)
@@ -191,7 +226,6 @@ with tab1:
                     else:
                         state['results'] = compare_json_objects(left_json, right_json)
 
-                    state['excluded_keys'] = []
                     st.success("✅ Comparison complete!")
 
     elif left_file or right_file:
@@ -199,23 +233,24 @@ with tab1:
 
     if state['results']:
         st.subheader("Comparison Results")
-        exclusion_keys = get_distinct_exclusion_keys(state['results'])
 
         with st.container():
+            st.markdown("**Apply Filters:**")
+            exclusion_keys = sorted(get_flattened_keys(left_json) | get_flattened_keys(right_json))
+
             if exclusion_keys:
                 selected_exclusions = st.multiselect(
-                    "Filter out fields:",
+                    "Filter out fields (including nested):",
                     options=exclusion_keys,
-                    #default=state['excluded_keys'],
-                    key="file_exclusion_selector",
-                    on_change=lambda: state.update({
-                        'excluded_keys': set(st.session_state.file_exclusion_selector)
-                    })
+                    default=list(state['excluded_keys']),
+                    key="file_exclusion_selector"
                 )
+
+                if st.button("Apply Filters", key="apply_filters_button"):
+                    state['excluded_keys'] = set(selected_exclusions)
+                    display_results("file", list(state['excluded_keys']))
             else:
                 st.info("No fields available for filtering")
-
-        display_results("file", selected_exclusions)
 
 with tab2:
     st.subheader("Compare JSON from APIs")
@@ -287,6 +322,83 @@ with tab2:
                 st.info("No fields available for filtering")
 
         display_results("api", selected_exclusions)
+
+with tab3:
+    st.subheader("JSON Formatter & Playground")
+    st.markdown("""
+    <style>
+    .json-formatter-header {
+        font-size: 1.2rem;
+        font-weight: 600;
+        margin-bottom: 0.5em;
+    }
+    .json-formatter-actions {
+        margin-bottom: 1em;
+    }
+    .json-formatter-success {
+        color: #198754;
+        font-weight: 500;
+    }
+    .json-formatter-error {
+        color: #dc3545;
+        font-weight: 500;
+    }
+    .json-formatter-area {
+        min-height: 400px;
+        height: 100%;
+        resize: vertical;
+        font-family: monospace;
+        font-size: 1rem;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    col1, col2 = st.columns(2, gap="large")
+    with col1:
+        st.markdown("**Input JSON**")
+        json_text = st.text_area("Paste or edit your JSON here:", height=400, key="json_formatter_input",
+                                placeholder='Paste or type your JSON here...',
+                                help="Paste any JSON to format, minify, validate, and copy.")
+        format_btn, minify_btn = st.columns(2)
+        format_clicked = format_btn.button("Format", key="format_json_btn")
+        minify_clicked = minify_btn.button("Minify", key="minify_json_btn")
+    with col2:
+        st.markdown("**Output & Actions**")
+        output_json = None
+        error_msg = None
+        if format_clicked or minify_clicked:
+            try:
+                parsed_json = json.loads(json_text)
+                if format_clicked:
+                    output_json = json.dumps(parsed_json, indent=2, ensure_ascii=False)
+                    st.markdown('<span class="json-formatter-success">Valid JSON! Expand/collapse below:</span>', unsafe_allow_html=True)
+                    st.json(parsed_json, expanded=True)
+                    st.markdown('<div class="json-formatter-actions">', unsafe_allow_html=True)
+                    st.code(output_json, language="json")
+                    st.button("Copy Output JSON", key="copy_output_json_btn", on_click=lambda: st.session_state.update({"copied_json": output_json}))
+                    st.markdown('</div>', unsafe_allow_html=True)
+                elif minify_clicked:
+                    output_json = json.dumps(parsed_json, separators=(',', ':'), ensure_ascii=False)
+                    st.markdown('<span class="json-formatter-success">Minified JSON below:</span>', unsafe_allow_html=True)
+                    st.code(output_json, language="json")
+                    st.button("Copy Output JSON", key="copy_output_json_btn_minify", on_click=lambda: st.session_state.update({"copied_json": output_json}))
+            except Exception as e:
+                error_msg = f"Invalid JSON: {e}"
+                st.markdown(f'<span class="json-formatter-error">{error_msg}</span>', unsafe_allow_html=True)
+        if error_msg:
+            st.info("Tip: Use the Format button for pretty JSON or Minify for compact JSON.")
+        # Show a copy success toast if copied
+        if st.session_state.get("copied_json"):
+            st.toast("Copied to clipboard! (Use ⌘+C or Ctrl+C to copy from the code box)")
+            st.session_state["copied_json"] = None
+        st.markdown("""
+        <ul>
+          <li>🔍 <b>Format</b> for pretty, indented JSON</li>
+          <li>⚡ <b>Minify</b> for compact JSON (great for APIs)</li>
+          <li>📋 <b>Copy</b> output JSON with one click</li>
+          <li>🧩 <b>Expand/collapse</b> JSON structure interactively (when formatted)</li>
+          <li>💡 <b>Instant validation</b> and error feedback</li>
+        </ul>
+        """, unsafe_allow_html=True)
 
 st.markdown("---")
 st.caption("JSON Comparison Utility")
